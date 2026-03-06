@@ -1,16 +1,16 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
 class Settings:
-    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    telegram_bot_username: str = os.getenv("TELEGRAM_BOT_USERNAME", "")
-    webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
-    public_base_url: str = os.getenv("PUBLIC_BASE_URL", "")
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-    port: int = int(os.getenv("PORT", "10000"))
+    telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    telegram_bot_username: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_USERNAME", ""))
+    webhook_secret: str = field(default_factory=lambda: os.getenv("WEBHOOK_SECRET", ""))
+    public_base_url: str = field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", ""))
+    openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
+    openrouter_model: str = field(default_factory=lambda: os.getenv("OPENROUTER_MODEL", "openrouter/free"))
+    port: int = field(default_factory=lambda: int(os.getenv("PORT", "10000")))
 
     def webhook_url(self) -> str:
         base = self.public_base_url.rstrip("/")
