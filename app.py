@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import threading
+import time
 
 from flask import Flask, jsonify, request
 from telegram import Update
@@ -29,7 +30,7 @@ judge = StoicJudge()
 
 telegram_app = None
 telegram_loop = None
-telegram_loop_thread = None
+telegram_thread = None
 _is_initialized = False
 
 
@@ -120,6 +121,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def initialize_telegram_app(app: Application) -> None:
     await app.initialize()
+    await app.start()
 
     if settings.public_base_url and settings.webhook_secret:
         webhook_url = settings.webhook_url()
@@ -133,13 +135,16 @@ async def initialize_telegram_app(app: Application) -> None:
         logger.warning("PUBLIC_BASE_URL или WEBHOOK_SECRET не заданы. Webhook не установлен.")
 
 
-def run_telegram_loop(loop: asyncio.AbstractEventLoop) -> None:
+def run_telegram_loop() -> None:
+    global telegram_loop
+    loop = asyncio.new_event_loop()
+    telegram_loop = loop
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 
 def initialize_telegram() -> None:
-    global _is_initialized, telegram_loop, telegram_loop_thread
+    global _is_initialized, telegram_thread
     if _is_initialized:
         return
 
@@ -148,14 +153,16 @@ def initialize_telegram() -> None:
         logger.warning("TELEGRAM_BOT_TOKEN не задан. Telegram приложение не инициализировано.")
         return
 
-    telegram_loop = asyncio.new_event_loop()
-    telegram_loop_thread = threading.Thread(
-        target=run_telegram_loop,
-        args=(telegram_loop,),
-        daemon=True,
-        name="telegram-event-loop",
-    )
-    telegram_loop_thread.start()
+    if telegram_loop is None:
+        telegram_thread = threading.Thread(
+            target=run_telegram_loop,
+            daemon=True,
+            name="telegram-event-loop",
+        )
+        telegram_thread.start()
+
+        while telegram_loop is None:
+            time.sleep(0.01)
 
     init_future = asyncio.run_coroutine_threadsafe(initialize_telegram_app(app), telegram_loop)
     init_future.result(timeout=30)
@@ -164,25 +171,27 @@ def initialize_telegram() -> None:
 
 
 def shutdown_telegram() -> None:
-    global telegram_loop, telegram_loop_thread, _is_initialized
+    global telegram_loop, telegram_thread, _is_initialized
 
     app = get_telegram_app()
     if app is None or telegram_loop is None:
         return
 
     if _is_initialized:
+        stop_future = asyncio.run_coroutine_threadsafe(app.stop(), telegram_loop)
         shutdown_future = asyncio.run_coroutine_threadsafe(app.shutdown(), telegram_loop)
         try:
+            stop_future.result(timeout=30)
             shutdown_future.result(timeout=30)
         except Exception as exc:
             logger.exception("Ошибка завершения Telegram приложения: %s", exc)
 
     telegram_loop.call_soon_threadsafe(telegram_loop.stop)
-    if telegram_loop_thread and telegram_loop_thread.is_alive():
-        telegram_loop_thread.join(timeout=5)
+    if telegram_thread and telegram_thread.is_alive():
+        telegram_thread.join(timeout=5)
     telegram_loop.close()
     telegram_loop = None
-    telegram_loop_thread = None
+    telegram_thread = None
     _is_initialized = False
 
 
