@@ -9,7 +9,7 @@ import time
 
 from flask import Flask, jsonify, request
 from telegram import Update
-from telegram.constants import ChatType
+from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from config import settings, validate_settings
@@ -27,6 +27,7 @@ logger.info("Telegram token loaded: %s", bool(settings.telegram_bot_token))
 
 flask_app = Flask(__name__)
 judge = StoicJudge()
+style_by_chat: dict[int, dict[str, str]] = {}
 
 telegram_app = None
 telegram_loop = None
@@ -99,23 +100,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(EMPTY_MENTION_REPLY)
         return
 
-    if is_image_request(clean_text):
-        prompt = extract_image_prompt(clean_text)
-        if not prompt:
-            await message.reply_text("После «нарисуй» добавь, что именно изобразить.")
+    stripped_text = clean_text.strip()
+    lowered_text = stripped_text.lower()
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else message.chat_id
+
+    if lowered_text in {"режим дерзкий", "отвечай дерзко", "будь жестче", "будь жёстче"}:
+        style_by_chat[chat_id] = {"mode": "bold", "custom": ""}
+        await message.reply_text("Принято. Теперь буду резче. Без хамства, но с удовольствием.")
+        return
+
+    if lowered_text in {"режим обычный", "отвечай обычно"}:
+        style_by_chat[chat_id] = {"mode": "default", "custom": ""}
+        await message.reply_text("Принято. Буду судить спокойно и без лишней истерики.")
+        return
+
+    if lowered_text == "режим стоик":
+        style_by_chat[chat_id] = {"mode": "stoic", "custom": ""}
+        await message.reply_text("Принято. Возвращаюсь к сухой строгости.")
+        return
+
+    custom_style_match = re.match(r"^отвечай\s+как\s+(.+)$", stripped_text, re.IGNORECASE)
+    if custom_style_match:
+        custom_style = custom_style_match.group(1).strip(" .,!?:;—-")
+        if custom_style:
+            style_by_chat[chat_id] = {"mode": "custom", "custom": custom_style}
+            await message.reply_text(f"Принято. Теперь говорю в таком стиле: {custom_style}")
             return
 
+    if lowered_text.startswith("нарисуй") or is_image_request(stripped_text):
+        prompt = extract_image_prompt(stripped_text)
+        if not prompt:
+            await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не рисует пустоту.")
+            return
+
+        logger.info("Image request received: %s", prompt)
         image_url = build_pollinations_url(prompt)
-        await message.reply_photo(
-            photo=image_url,
-            caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt[:120]),
-            reply_to_message_id=message.message_id,
-        )
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+        try:
+            await message.reply_photo(
+                photo=image_url,
+                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt[:120]),
+                reply_to_message_id=message.message_id,
+            )
+        except Exception:
+            logger.exception("Failed to send generated image")
+            await message.reply_text(
+                "Марк Аврелий хотел бы это изобразить, но небеса сегодня скупы на визуальные откровения. "
+                "Сформулируй образ точнее."
+            )
         return
 
     think_message = await message.reply_text(THINKING_TEXT, reply_to_message_id=message.message_id)
     await asyncio.sleep(random.uniform(2.0, 3.0))
-    final_text = judge.evaluate(clean_text)
+    style_state = style_by_chat.get(chat_id, {"mode": "default", "custom": ""})
+    try:
+        final_text = judge.evaluate(
+            clean_text,
+            style_mode=style_state.get("mode", "default"),
+            custom_style=style_state.get("custom", ""),
+        )
+    except Exception:
+        logger.exception("Failed to evaluate text request")
+        final_text = (
+            "Я бы ответил точнее, но сегодня даже разум спотыкается о судьбу. "
+            "Скажи мысль проще и короче — разберём хладнокровно."
+        )
     await think_message.edit_text(final_text)
 
 

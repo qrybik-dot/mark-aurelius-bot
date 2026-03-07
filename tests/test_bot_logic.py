@@ -26,6 +26,12 @@ class FallbackTests(unittest.TestCase):
         self.assertIn("Марк Аврелий", text)
         self.assertTrue("доволен" in text or "недоволен" in text)
 
+    def test_bold_style_adds_opening(self):
+        judge = StoicJudge()
+        text = judge._fallback_reply("я выбираю спорт и учебу", style_mode="bold")
+        self.assertIn("Марк Аврелий", text)
+        self.assertGreaterEqual(text.count("\n\n"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
