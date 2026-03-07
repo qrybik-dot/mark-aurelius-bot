@@ -1,5 +1,18 @@
+import importlib
+import importlib.util
 import os
 from dataclasses import dataclass, field
+
+
+def _load_local_dotenv() -> None:
+    if importlib.util.find_spec("dotenv") is None:
+        return
+
+    dotenv = importlib.import_module("dotenv")
+    dotenv.load_dotenv()
+
+
+_load_local_dotenv()
 
 
 @dataclass(frozen=True)
@@ -19,5 +32,14 @@ class Settings:
 
 settings = Settings()
 
-if not settings.telegram_bot_token:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
+def validate_settings() -> list[str]:
+    missing: list[str] = []
+
+    if not settings.telegram_bot_token:
+        missing.append("TELEGRAM_BOT_TOKEN")
+
+    if not settings.telegram_bot_username:
+        missing.append("TELEGRAM_BOT_USERNAME")
+
+    return missing
