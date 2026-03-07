@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-from config import settings
+from config import settings, validate_settings
 from image_gen import build_pollinations_url, extract_image_prompt, is_image_request
 from prompts import EMPTY_MENTION_REPLY, IMAGE_CAPTION_TEMPLATE, THINKING_TEXT
 from stoic_ai import StoicJudge
@@ -24,8 +24,22 @@ logger.info("Telegram token loaded: %s", bool(settings.telegram_bot_token))
 flask_app = Flask(__name__)
 judge = StoicJudge()
 
-telegram_app = Application.builder().token(settings.telegram_bot_token).build()
+telegram_app = None
 _is_initialized = False
+
+
+def get_telegram_app() -> Application | None:
+    global telegram_app
+
+    if telegram_app is not None:
+        return telegram_app
+
+    if not settings.telegram_bot_token:
+        return None
+
+    telegram_app = Application.builder().token(settings.telegram_bot_token).build()
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return telegram_app
 
 
 def normalize_username(username: str) -> str:
@@ -94,23 +108,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await think_message.edit_text(final_text)
 
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-
 async def initialize_telegram() -> None:
     global _is_initialized
     if _is_initialized:
         return
 
-    if not settings.telegram_bot_token:
-        logger.warning("TELEGRAM_BOT_TOKEN не задан. Webhook не инициализирован.")
+    app = get_telegram_app()
+    if app is None:
+        logger.warning("TELEGRAM_BOT_TOKEN не задан. Telegram приложение не инициализировано.")
         return
 
-    await telegram_app.initialize()
+    await app.initialize()
 
     if settings.public_base_url and settings.webhook_secret:
         webhook_url = settings.webhook_url()
-        await telegram_app.bot.set_webhook(
+        await app.bot.set_webhook(
             url=webhook_url,
             secret_token=settings.webhook_secret,
             allowed_updates=Update.ALL_TYPES,
@@ -124,11 +136,26 @@ async def initialize_telegram() -> None:
 
 @flask_app.get("/")
 def healthcheck():
-    return jsonify({"status": "ok", "service": "mark-aurelius-bot"})
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "mark-aurelius-bot",
+            "env": {
+                "telegram_bot_token_present": bool(settings.telegram_bot_token),
+                "telegram_bot_username_present": bool(settings.telegram_bot_username),
+                "webhook_secret_present": bool(settings.webhook_secret),
+                "public_base_url_present": bool(settings.public_base_url),
+            },
+        }
+    )
 
 
 @flask_app.post("/webhook/<path_secret>")
 def telegram_webhook(path_secret: str):
+    app = get_telegram_app()
+    if app is None:
+        return jsonify({"ok": False, "error": "telegram app is not configured"}), 503
+
     if path_secret != settings.webhook_secret:
         return jsonify({"ok": False, "error": "invalid webhook path"}), 403
 
@@ -140,9 +167,9 @@ def telegram_webhook(path_secret: str):
     if not data:
         return jsonify({"ok": False, "error": "invalid update payload"}), 400
 
-    update = Update.de_json(data, telegram_app.bot)
+    update = Update.de_json(data, app.bot)
     try:
-        asyncio.run(telegram_app.process_update(update))
+        asyncio.run(app.process_update(update))
     except Exception as exc:
         logger.exception("Ошибка обработки апдейта: %s", exc)
         return jsonify({"ok": False}), 500
@@ -151,6 +178,10 @@ def telegram_webhook(path_secret: str):
 
 
 def bootstrap() -> None:
+    missing_critical = validate_settings()
+    if missing_critical:
+        logger.warning("Missing critical settings: %s", ", ".join(missing_critical))
+
     try:
         asyncio.run(initialize_telegram())
     except Exception as exc:
