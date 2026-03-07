@@ -1,8 +1,8 @@
 import asyncio
 import atexit
 import concurrent.futures
-import logging
 import io
+import logging
 import re
 import threading
 import time
@@ -16,7 +16,9 @@ from config import settings, validate_settings
 from image_gen import (
     build_image_prompt,
     build_image_request_candidates,
+    configured_image_providers,
     extract_image_prompt,
+    generate_image_cloudflare,
     is_image_request,
 )
 from prompts import EMPTY_MENTION_REPLY, IMAGE_CAPTION_TEMPLATE, THINKING_TEXT
@@ -124,71 +126,75 @@ def apply_style_command(chat_id: int, stripped_text: str) -> str | None:
 
 
 async def send_generated_image(message, context, chat_id: int, prompt_raw: str) -> None:
-    logger.info("Image request received: %s", prompt_raw)
+    logger.info("event=image_trigger_detected prompt_raw=%s", prompt_raw)
     prompt_en = build_image_prompt(prompt_raw)
-    logger.info("Image prompt normalized: %s", prompt_en)
+    logger.info("event=image_prompt_normalized prompt_en=%s", prompt_en)
 
     if not prompt_en:
         await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не изображает пустоту.")
         return
 
-    try:
-        import requests
-    except Exception as exc:
-        logger.warning("requests недоступен для image bytes fallback: %s", exc)
-        requests = None
-
-    candidates = build_image_request_candidates(prompt_en)
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
     last_error: Exception | None = None
-    for candidate in candidates:
-        backend_name = candidate.get("backend", "unknown")
-        image_url = candidate.get("url", "")
-        logger.info("Trying image backend: %s", backend_name)
-        logger.info("Trying image URL: %s", image_url)
+    providers = configured_image_providers()
+    for provider in providers:
+        logger.info("event=image_provider_start provider=%s", provider)
 
         try:
-            await message.reply_photo(
-                photo=image_url,
-                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
-                reply_to_message_id=message.message_id,
-            )
-            return
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Image URL send failed: %s (%s)", backend_name, exc)
+            image_bytes = b""
+            stream_name = "generated.jpg"
 
-        if requests is None:
-            logger.warning("Image bytes send failed: %s", backend_name)
-            continue
+            if provider == "cloudflare":
+                image_bytes = generate_image_cloudflare(prompt_en, timeout_s=20)
+                stream_name = "cloudflare.jpg"
+            elif provider in {"pollinations", "pollinations_flux"}:
+                import requests
 
-        try:
-            response = requests.get(image_url, timeout=20)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "")
-            if "image" not in content_type.lower():
-                raise ValueError(f"unexpected content type: {content_type}")
-            photo_stream = io.BytesIO(response.content)
-            photo_stream.name = f"{backend_name}.jpg"
+                candidate = next(
+                    (c for c in build_image_request_candidates(prompt_en) if c.get("backend") == provider),
+                    None,
+                )
+                if not candidate:
+                    raise ValueError(f"unknown image backend: {provider}")
+                response = requests.get(candidate["url"], timeout=15)
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "")
+                if "image" not in content_type.lower():
+                    raise ValueError(f"unexpected content type: {content_type}")
+                image_bytes = response.content
+                stream_name = f"{provider}.jpg"
+            else:
+                raise ValueError(f"unsupported image provider: {provider}")
+
+            if not image_bytes:
+                raise ValueError("empty image bytes")
+
+            logger.info("event=image_provider_success provider=%s bytes=%s", provider, len(image_bytes))
+
+            photo_stream = io.BytesIO(image_bytes)
+            photo_stream.name = stream_name
+            logger.info("event=telegram_upload_start provider=%s", provider)
+
             await message.reply_photo(
                 photo=photo_stream,
                 caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
                 reply_to_message_id=message.message_id,
             )
+            logger.info("event=telegram_upload_success provider=%s", provider)
             return
         except Exception as exc:
             last_error = exc
-            logger.warning("Image bytes send failed: %s (%s)", backend_name, exc)
-            logger.warning("Image backend failed: %s", backend_name)
+            logger.warning("event=image_provider_failure provider=%s error=%s", provider, exc)
 
     if last_error is not None:
         logger.exception("Image backend exhausted", exc_info=(type(last_error), last_error, last_error.__traceback__))
     else:
         logger.exception("Image backend exhausted")
     await message.reply_text(
-        "Генерация изображения сейчас недоступна. Текстовый суд работает, а визуальный — нет."
+        "Сегодня даже художники Рима подвели. Попробуй ещё раз чуть позже."
     )
+    logger.info("event=image_fallback_message_sent")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -362,10 +368,10 @@ def telegram_webhook(path_secret: str):
             return jsonify({"ok": False, "error": "telegram event loop is not initialized"}), 503
 
         future = asyncio.run_coroutine_threadsafe(app.process_update(update), telegram_loop)
-        future.result(timeout=30)
+        future.result(timeout=15)
     except concurrent.futures.TimeoutError:
-        logger.exception("Таймаут обработки апдейта")
-        return jsonify({"ok": False}), 500
+        logger.warning("Таймаут обработки апдейта, продолжаем в фоне")
+        return jsonify({"ok": True, "queued": True})
     except Exception as exc:
         logger.exception("Ошибка обработки апдейта: %s", exc)
         return jsonify({"ok": False}), 500

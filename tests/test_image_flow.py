@@ -3,7 +3,7 @@ import io
 from types import SimpleNamespace
 
 import app
-from image_gen import build_image_prompt, build_image_request_candidates, extract_image_prompt, is_image_request
+from image_gen import build_image_prompt, configured_image_providers, extract_image_prompt, is_image_request
 
 
 class _ThinkMessage:
@@ -15,13 +15,12 @@ class _ThinkMessage:
 
 
 class _Message:
-    def __init__(self, text: str, chat_id: int = 42, fail_urls=None, fail_bytes=None):
+    def __init__(self, text: str, chat_id: int = 42, fail_bytes=None):
         self.text = text
         self.chat_id = chat_id
         self.message_id = 7
         self.photo_calls = []
         self.reply_text_calls = []
-        self.fail_urls = set(fail_urls or [])
         self.fail_bytes = set(fail_bytes or [])
 
     async def reply_text(self, text, **kwargs):
@@ -31,10 +30,7 @@ class _Message:
     async def reply_photo(self, **kwargs):
         self.photo_calls.append(kwargs)
         photo = kwargs.get("photo")
-        if isinstance(photo, str):
-            if any(tag in photo for tag in self.fail_urls):
-                raise RuntimeError("url send failed")
-        elif isinstance(photo, io.BytesIO):
+        if isinstance(photo, io.BytesIO):
             if photo.name.replace(".jpg", "") in self.fail_bytes:
                 raise RuntimeError("bytes send failed")
 
@@ -81,11 +77,13 @@ def test_narisuy_kofe_goes_image_flow(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             raise AssertionError("Text branch must not be called for image flow")
 
-    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(app, "configured_image_providers", lambda: ["cloudflare"])
+    monkeypatch.setattr(app, "generate_image_cloudflare", lambda *_args, **_kwargs: b"image-bytes")
     message = _Message("нарисуй кофе")
     message, bot = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
     assert bot.actions
     assert len(message.photo_calls) == 1
+    assert isinstance(message.photo_calls[0]["photo"], io.BytesIO)
 
 
 def test_narisuy_krug_goes_image_flow(monkeypatch):
@@ -93,7 +91,8 @@ def test_narisuy_krug_goes_image_flow(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             raise AssertionError("Text branch must not be called for image flow")
 
-    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(app, "configured_image_providers", lambda: ["cloudflare"])
+    monkeypatch.setattr(app, "generate_image_cloudflare", lambda *_args, **_kwargs: b"image-bytes")
     message = _Message("нарисуй круг")
     message, _ = _run_handle_text("нарисуй круг", monkeypatch, _Judge(), message)
     assert len(message.photo_calls) == 1
@@ -109,29 +108,19 @@ def test_narisuy_without_prompt_returns_error(monkeypatch):
     assert any("нужна сама идея" in text for text in message.reply_text_calls)
 
 
-def test_builds_candidates_for_primary_and_backup(monkeypatch):
+def test_provider_selection_prefers_cloudflare(monkeypatch):
     import image_gen
 
     monkeypatch.setattr(
         image_gen,
         "settings",
-        SimpleNamespace(image_backend_primary="pollinations", image_backend_backup="pollinations_flux"),
+        SimpleNamespace(
+            image_provider_primary="cloudflare",
+            image_backend_primary="pollinations",
+            image_backend_backup="pollinations_flux",
+        ),
     )
-    prompt = build_image_prompt("кофе")
-    candidates = build_image_request_candidates(prompt)
-    assert [c["backend"] for c in candidates] == ["pollinations", "pollinations_flux"]
-
-
-def test_if_url_fails_bytes_mode_is_used(monkeypatch):
-    class _Judge:
-        def evaluate(self, *_args, **_kwargs):
-            return "should not happen"
-
-    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
-    message = _Message("нарисуй кофе", fail_urls={"pollinations"})
-    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
-    assert len(message.photo_calls) >= 2
-    assert any(isinstance(call["photo"], io.BytesIO) for call in message.photo_calls)
+    assert configured_image_providers() == ["cloudflare", "pollinations", "pollinations_flux"]
 
 
 def test_if_primary_fails_backup_called(monkeypatch):
@@ -139,11 +128,25 @@ def test_if_primary_fails_backup_called(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             return "should not happen"
 
-    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
-    message = _Message("нарисуй кофе", fail_urls={"pollinations"}, fail_bytes={"pollinations"})
+    monkeypatch.setattr(app, "configured_image_providers", lambda: ["cloudflare", "pollinations"])
+
+    calls = {"cf": 0, "get": 0}
+
+    def _cf_fail(*_args, **_kwargs):
+        calls["cf"] += 1
+        raise RuntimeError("cf failed")
+
+    monkeypatch.setattr(app, "generate_image_cloudflare", _cf_fail)
+
+    import requests
+
+    monkeypatch.setattr(requests, "get", lambda *_args, **_kwargs: _Response())
+
+    message = _Message("нарисуй кофе")
     message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
-    sent_urls = [call["photo"] for call in message.photo_calls if isinstance(call["photo"], str)]
-    assert any("model=flux" in u for u in sent_urls)
+    assert calls["cf"] == 1
+    assert len(message.photo_calls) == 1
+    assert isinstance(message.photo_calls[0]["photo"], io.BytesIO)
 
 
 def test_if_all_fail_honest_tech_fallback(monkeypatch):
@@ -151,14 +154,15 @@ def test_if_all_fail_honest_tech_fallback(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             return "should not happen"
 
-    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response(content_type="text/plain"))
-    message = _Message(
-        "нарисуй кофе",
-        fail_urls={"pollinations", "pollinations_flux"},
-        fail_bytes={"pollinations", "pollinations_flux"},
+    monkeypatch.setattr(app, "configured_image_providers", lambda: ["cloudflare"])
+    monkeypatch.setattr(
+        app,
+        "generate_image_cloudflare",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cf failed")),
     )
+    message = _Message("нарисуй кофе")
     message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
-    assert any("Генерация изображения сейчас недоступна" in text for text in message.reply_text_calls)
+    assert any("Сегодня даже художники Рима подвели" in text for text in message.reply_text_calls)
 
 
 def test_extract_and_trigger():

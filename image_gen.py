@@ -1,5 +1,9 @@
+import base64
+import json
 import re
 from urllib.parse import quote
+
+import requests
 
 from config import settings
 
@@ -21,6 +25,8 @@ _IMAGE_BACKENDS = {
         "params": "width=768&height=768&model=flux&nologo=true",
     },
 }
+
+_CF_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 
 _RU_IMAGE_HINTS = {
@@ -49,6 +55,20 @@ def _configured_image_backends() -> list[str]:
             deduped.append(backend)
     if not deduped:
         deduped = ["pollinations", "pollinations_flux"]
+    return deduped
+
+
+def configured_image_providers() -> list[str]:
+    primary = (settings.image_provider_primary or "cloudflare").strip().lower()
+    providers = [primary]
+
+    if primary != "pollinations":
+        providers.extend(_configured_image_backends())
+
+    deduped: list[str] = []
+    for provider in providers:
+        if provider and provider not in deduped:
+            deduped.append(provider)
     return deduped
 
 
@@ -104,6 +124,52 @@ def build_image_request_candidates(prompt_en: str) -> list[dict[str, str]]:
             }
         )
     return candidates
+
+
+def _decode_cf_response_content(response: requests.Response) -> bytes:
+    content_type = response.headers.get("Content-Type", "").lower()
+    raw_content = response.content or b""
+
+    if "image/" in content_type:
+        return raw_content
+
+    payload = response.json()
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        raise ValueError("Cloudflare response missing result payload")
+
+    image_b64 = result.get("image") or result.get("output")
+    if isinstance(image_b64, list) and image_b64:
+        image_b64 = image_b64[0]
+    if not isinstance(image_b64, str):
+        raise ValueError("Cloudflare response missing image field")
+
+    encoded = image_b64.split(",", 1)[-1]
+    return base64.b64decode(encoded)
+
+
+def generate_image_cloudflare(prompt_en: str, timeout_s: int = 20) -> bytes:
+    if not settings.cf_api_token or not settings.cf_account_id:
+        raise ValueError("Cloudflare image generation is not configured")
+
+    endpoint = (
+        f"https://api.cloudflare.com/client/v4/accounts/{settings.cf_account_id}"
+        f"/ai/run/{_CF_MODEL}"
+    )
+    headers = {
+        "Authorization": f"Bearer {settings.cf_api_token}",
+        "Content-Type": "application/json",
+    }
+    body = {"prompt": prompt_en}
+
+    response = requests.post(
+        endpoint,
+        headers=headers,
+        data=json.dumps(body),
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+    return _decode_cf_response_content(response)
 
 
 def build_image_url_primary(prompt_en: str) -> str:
