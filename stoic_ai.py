@@ -10,17 +10,25 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
+def build_system_prompt(style_mode: str = "default", custom_style: str = "") -> list[dict[str, str]]:
+    style_layer = STYLE_INSTRUCTIONS.get(style_mode, STYLE_INSTRUCTIONS["default"])
+    if style_mode == "custom" and custom_style:
+        style_layer = (
+            "Используй описанную пользователем манеру речи: "
+            f"{custom_style}. Не нарушай safety и не уходи в бессмысленный фарс."
+        )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": style_layer},
+    ]
+
+
 class StoicJudge:
     def evaluate(self, user_text: str, style_mode: str = "default", custom_style: str = "") -> str:
         ai_reply = self._openrouter_reply(user_text, style_mode, custom_style)
         if ai_reply:
             return ai_reply
         return self._fallback_reply(user_text, style_mode)
-
-    def _style_layer(self, style_mode: str, custom_style: str) -> str:
-        if style_mode == "custom" and custom_style:
-            return f"Желаемый стиль ответа от пользователя: {custom_style}. Соблюдай его бережно и без мата."
-        return STYLE_INSTRUCTIONS.get(style_mode, STYLE_INSTRUCTIONS["default"])
 
     def _openrouter_reply(self, user_text: str, style_mode: str, custom_style: str) -> Optional[str]:
         if not settings.openrouter_api_key:
@@ -40,8 +48,7 @@ class StoicJudge:
         payload = {
             "model": settings.openrouter_model or "openrouter/free",
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "system", "content": self._style_layer(style_mode, custom_style)},
+                *build_system_prompt(style_mode, custom_style),
                 {"role": "user", "content": user_text},
             ],
             "temperature": 0.8,
