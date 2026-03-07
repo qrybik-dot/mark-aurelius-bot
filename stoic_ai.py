@@ -42,6 +42,35 @@ RESPONSE_SCHEMA = {
 }
 
 
+def _candidate_models() -> list[str]:
+    models: list[str] = []
+
+    configured_primary = settings.openrouter_model_primary
+    configured_backup = settings.openrouter_model_backup
+
+    if configured_primary:
+        primary = configured_primary
+    elif settings.openrouter_model and settings.openrouter_model != "openrouter/free":
+        primary = settings.openrouter_model
+    else:
+        primary = ""
+
+    backup = configured_backup or "openrouter/free"
+
+    if primary:
+        models.append(primary)
+    if backup:
+        models.append(backup)
+    if "openrouter/free" not in models:
+        models.append("openrouter/free")
+
+    deduped: list[str] = []
+    for model in models:
+        if model and model not in deduped:
+            deduped.append(model)
+    return deduped
+
+
 def normalize_explanation(explanation: str) -> str:
     text = re.sub(r"\s+", " ", (explanation or "").strip())
     if not text:
@@ -145,15 +174,22 @@ def analyze_idea_fallback(user_text: str) -> tuple[str, str]:
 
 
 class StoicJudge:
+    def analyze_deterministic(self, user_text: str) -> tuple[str, str]:
+        return analyze_idea_fallback(user_text)
+
+    def render_final(self, verdict: str, explanation: str, style_mode: str = "default", custom_style: str = "") -> str:
+        styled = style_explanation(explanation, style_mode=style_mode, custom_style=custom_style)
+        return build_final_reply(verdict, styled)
+
     def evaluate(self, user_text: str, style_mode: str = "default", custom_style: str = "") -> str:
         model_result = self._openrouter_reply(user_text, style_mode, custom_style)
         if model_result is None:
+            logger.warning("Falling back to deterministic analyzer")
             verdict, explanation = analyze_idea_fallback(user_text)
         else:
             verdict, explanation = model_result
 
-        styled = style_explanation(explanation, style_mode=style_mode, custom_style=custom_style)
-        return build_final_reply(verdict, styled)
+        return self.render_final(verdict, explanation, style_mode=style_mode, custom_style=custom_style)
 
     def _openrouter_reply(
         self, user_text: str, style_mode: str, custom_style: str
@@ -168,45 +204,48 @@ class StoicJudge:
             logger.warning("requests недоступен (%s), включаю fallback", exc)
             return None
 
-        model_name = settings.openrouter_model or "openrouter/free"
-        logger.info("OpenRouter model selected: %s", model_name)
-        if model_name == "openrouter/free":
-            logger.warning(
-                "Using openrouter/free router: output may vary because free models are selected dynamically"
-            )
-
         headers = {
             "Authorization": f"Bearer {settings.openrouter_api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": model_name,
-            "messages": [
-                *build_system_prompt(style_mode, custom_style),
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 220,
-            "seed": 42,
-            "response_format": {"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
-        }
 
-        try:
-            response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=20)
-            if response.status_code in (401, 402, 403, 429, 500, 502, 503, 504):
-                logger.warning("OpenRouter недоступен, код=%s", response.status_code)
-                return None
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = json.loads(content)
-            verdict = parsed.get("verdict")
-            explanation = parsed.get("explanation", "")
-            if verdict not in {"positive", "negative"}:
-                raise ValueError("invalid verdict")
-            if not isinstance(explanation, str):
-                raise ValueError("invalid explanation")
-            return verdict, explanation
-        except (requests.RequestException, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
-            logger.warning("Structured output parse failed, using deterministic fallback: %s", exc)
-            return None
+        for model_name in _candidate_models():
+            logger.info("Trying text model: %s", model_name)
+            payload = {
+                "model": model_name,
+                "messages": [
+                    *build_system_prompt(style_mode, custom_style),
+                    {"role": "user", "content": user_text},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 220,
+                "seed": 42,
+                "response_format": {"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
+            }
+
+            try:
+                response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=20)
+                if response.status_code in (401, 402, 403, 429, 500, 502, 503, 504):
+                    logger.warning("Text model failed: %s", model_name)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                parsed = json.loads(content)
+                verdict = parsed.get("verdict")
+                explanation = parsed.get("explanation", "")
+                if verdict not in {"positive", "negative"}:
+                    logger.warning("Structured output invalid for model: %s", model_name)
+                    continue
+                if not isinstance(explanation, str):
+                    logger.warning("Structured output invalid for model: %s", model_name)
+                    continue
+                return verdict, explanation
+            except (requests.Timeout, requests.RequestException):
+                logger.warning("Text model failed: %s", model_name)
+                continue
+            except (ValueError, KeyError, IndexError, json.JSONDecodeError):
+                logger.warning("Structured output invalid for model: %s", model_name)
+                continue
+
+        return None

@@ -7,7 +7,7 @@ Production-ready MVP Telegram-бота на Python с webhook-архитекту
 - через 2–3 секунды выносит вердикт
 - добавляет короткое объяснение на русском языке
 
-Также умеет генерировать изображения через Pollinations по командам вида «нарисуй ...».
+Также умеет генерировать изображения по командам вида «нарисуй ...» с primary/backup backend цепочкой и fallback-отправкой bytes, если Telegram не принимает внешний URL.
 
 ## Стек
 - Python 3.11
@@ -37,7 +37,11 @@ Production-ready MVP Telegram-бота на Python с webhook-архитекту
 - `WEBHOOK_SECRET`
 - `PUBLIC_BASE_URL`
 - `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL` (по умолчанию `openrouter/free`)
+- `OPENROUTER_MODEL` (legacy-совместимость, по умолчанию `openrouter/free`)
+- `OPENROUTER_MODEL_PRIMARY` (основная текстовая модель)
+- `OPENROUTER_MODEL_BACKUP` (резервная текстовая модель, по умолчанию `openrouter/free`)
+- `IMAGE_BACKEND_PRIMARY` (основной image backend, по умолчанию `pollinations`)
+- `IMAGE_BACKEND_BACKUP` (резервный image backend, по умолчанию `pollinations_flux`)
 - `PORT` (по умолчанию `10000`)
 
 > Важно: сервис стартует даже без `TELEGRAM_BOT_TOKEN`, чтобы healthcheck не падал.
@@ -114,14 +118,24 @@ Production-ready MVP Telegram-бота на Python с webhook-архитекту
 - есть mention `@TELEGRAM_BOT_USERNAME`, или
 - сообщение — reply на сообщение бота.
 
+Иначе сообщение игнорируется (mention/reply-only режим для групп и supergroup).
+
 Mention удаляется из текста перед анализом.
 Если после удаления mention текст пустой, бот отвечает короткой фразой.
 
+### Текстовый flow (primary/backup + deterministic fallback)
+1. Бот пробует `OPENROUTER_MODEL_PRIMARY`.
+2. При ошибке/таймауте/невалидном structured-output пробует `OPENROUTER_MODEL_BACKUP`.
+3. Если обе модели не дали валидный ответ, использует локальный deterministic analyzer.
+4. Финальный формат ответа всегда фиксирован: первая строка verdict + пустая строка + короткое объяснение.
+
 ### Генерация изображений
 Если сообщение начинается с «нарисуй» (или синонимов), бот:
-1. берёт оставшийся текст как prompt,
-2. генерирует URL для Pollinations,
-3. отправляет изображение как `photo reply` с короткой подписью.
+1. берёт оставшийся текст как prompt и нормализует его,
+2. строит кандидатов `IMAGE_BACKEND_PRIMARY` -> `IMAGE_BACKEND_BACKUP`,
+3. для каждого backend пробует отправку `reply_photo(url)`,
+4. если URL не принят Telegram — скачивает изображение и отправляет как bytes/file-like object,
+5. если все backend исчерпаны — отправляет честный технический fallback.
 
 ## Проверка перед продом
 - Проверь, что `PUBLIC_BASE_URL` указывает на публичный HTTPS URL сервиса.
