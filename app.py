@@ -13,7 +13,7 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from config import settings, validate_settings
-from image_gen import build_pollinations_url, extract_image_prompt, is_image_request
+from image_gen import build_image_prompt, generate_image_url
 from prompts import EMPTY_MENTION_REPLY, IMAGE_CAPTION_TEMPLATE, THINKING_TEXT
 from stoic_ai import StoicJudge
 
@@ -87,6 +87,37 @@ def strip_bot_mention(text: str, bot_username: str) -> str:
     return pattern.sub("", text).strip()
 
 
+def parse_image_prompt(stripped_text: str) -> str:
+    if not stripped_text.lower().startswith("нарисуй"):
+        return ""
+    return stripped_text[len("нарисуй"):].strip(" :,-.")
+
+
+def apply_style_command(chat_id: int, stripped_text: str) -> str | None:
+    lowered_text = stripped_text.lower()
+
+    if lowered_text in {"режим дерзкий", "отвечай дерзко", "будь жестче", "будь жёстче", "режим roast"}:
+        style_by_chat[chat_id] = {"mode": "bold", "custom": ""}
+        return "Принято. Теперь буду резче. Без хамства, но с удовольствием."
+
+    if lowered_text in {"режим обычный", "отвечай обычно", "сбрось стиль"}:
+        style_by_chat[chat_id] = {"mode": "default", "custom": ""}
+        return "Принято. Возвращаюсь к спокойной манере."
+
+    if lowered_text in {"режим стоик", "режим стоический"}:
+        style_by_chat[chat_id] = {"mode": "stoic", "custom": ""}
+        return "Принято. Возвращаюсь к сухой строгости."
+
+    custom_style_match = re.match(r"^(отвечай|говори)\s+как\s+(.+)$", stripped_text, re.IGNORECASE)
+    if custom_style_match:
+        custom_style = custom_style_match.group(2).strip(" .,!?:;—-")
+        if custom_style:
+            style_by_chat[chat_id] = {"mode": "custom", "custom": custom_style}
+            return f"Принято. Теперь говорю в таком стиле: {custom_style}"
+
+    return None
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not message.text:
@@ -106,42 +137,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat = update.effective_chat
     chat_id = chat.id if chat else message.chat_id
 
-    if lowered_text in {"режим дерзкий", "отвечай дерзко", "будь жестче", "будь жёстче"}:
-        style_by_chat[chat_id] = {"mode": "bold", "custom": ""}
-        await message.reply_text("Принято. Теперь буду резче. Без хамства, но с удовольствием.")
+    style_reply = apply_style_command(chat_id, stripped_text)
+    if style_reply:
+        await message.reply_text(style_reply)
         return
 
-    if lowered_text in {"режим обычный", "отвечай обычно"}:
-        style_by_chat[chat_id] = {"mode": "default", "custom": ""}
-        await message.reply_text("Принято. Буду судить спокойно и без лишней истерики.")
-        return
-
-    if lowered_text == "режим стоик":
-        style_by_chat[chat_id] = {"mode": "stoic", "custom": ""}
-        await message.reply_text("Принято. Возвращаюсь к сухой строгости.")
-        return
-
-    custom_style_match = re.match(r"^отвечай\s+как\s+(.+)$", stripped_text, re.IGNORECASE)
-    if custom_style_match:
-        custom_style = custom_style_match.group(1).strip(" .,!?:;—-")
-        if custom_style:
-            style_by_chat[chat_id] = {"mode": "custom", "custom": custom_style}
-            await message.reply_text(f"Принято. Теперь говорю в таком стиле: {custom_style}")
+    if lowered_text.startswith("нарисуй"):
+        prompt_raw = parse_image_prompt(stripped_text)
+        if not prompt_raw:
+            await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не изображает пустоту.")
             return
 
-    if lowered_text.startswith("нарисуй") or is_image_request(stripped_text):
-        prompt = extract_image_prompt(stripped_text)
-        if not prompt:
-            await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не рисует пустоту.")
-            return
-
-        logger.info("Image request received: %s", prompt)
-        image_url = build_pollinations_url(prompt)
+        logger.info("Image request received: %s", prompt_raw)
+        prompt_en = build_image_prompt(prompt_raw)
+        logger.info("Image prompt normalized: %s", prompt_en)
+        image_url = generate_image_url(prompt_en)
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
         try:
             await message.reply_photo(
                 photo=image_url,
-                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt[:120]),
+                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
                 reply_to_message_id=message.message_id,
             )
         except Exception:
