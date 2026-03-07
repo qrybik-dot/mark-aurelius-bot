@@ -40,8 +40,11 @@ Production-ready MVP Telegram-бота на Python с webhook-архитекту
 - `OPENROUTER_MODEL` (legacy-совместимость, по умолчанию `openrouter/free`)
 - `OPENROUTER_MODEL_PRIMARY` (основная текстовая модель)
 - `OPENROUTER_MODEL_BACKUP` (резервная текстовая модель, по умолчанию `openrouter/free`)
-- `IMAGE_BACKEND_PRIMARY` (основной image backend, по умолчанию `pollinations`)
-- `IMAGE_BACKEND_BACKUP` (резервный image backend, по умолчанию `pollinations_flux`)
+- `IMAGE_PROVIDER_PRIMARY` (основной image provider, рекомендуется `cloudflare`)
+- `CF_API_TOKEN` (токен Cloudflare API для Workers AI)
+- `CF_ACCOUNT_ID` (ID аккаунта Cloudflare для Workers AI)
+- `IMAGE_BACKEND_PRIMARY` (legacy fallback backend, по умолчанию `pollinations`)
+- `IMAGE_BACKEND_BACKUP` (legacy backup backend, по умолчанию `pollinations_flux`)
 - `PORT` (по умолчанию `10000`)
 
 > Важно: сервис стартует даже без `TELEGRAM_BOT_TOKEN`, чтобы healthcheck не падал.
@@ -132,10 +135,15 @@ Mention удаляется из текста перед анализом.
 ### Генерация изображений
 Если сообщение начинается с «нарисуй» (или синонимов), бот:
 1. берёт оставшийся текст как prompt и нормализует его,
-2. строит кандидатов `IMAGE_BACKEND_PRIMARY` -> `IMAGE_BACKEND_BACKUP`,
-3. для каждого backend пробует отправку `reply_photo(url)`,
-4. если URL не принят Telegram — скачивает изображение и отправляет как bytes/file-like object,
-5. если все backend исчерпаны — отправляет честный технический fallback.
+2. сначала пробует Cloudflare Workers AI (`IMAGE_PROVIDER_PRIMARY=cloudflare`),
+3. отправляет изображение в Telegram как bytes (multipart upload),
+4. при сбое (опционально) использует legacy fallback backends,
+5. если все провайдеры исчерпаны — отправляет честный технический fallback.
+
+Минимально необходимый набор переменных для основного image flow:
+- `IMAGE_PROVIDER_PRIMARY=cloudflare`
+- `CF_API_TOKEN=<your_token>`
+- `CF_ACCOUNT_ID=<your_account_id>`
 
 ## Проверка перед продом
 - Проверь, что `PUBLIC_BASE_URL` указывает на публичный HTTPS URL сервиса.

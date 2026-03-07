@@ -31,6 +31,9 @@ class Settings:
     )
     image_backend_primary: str = field(default_factory=lambda: os.getenv("IMAGE_BACKEND_PRIMARY", "").strip())
     image_backend_backup: str = field(default_factory=lambda: os.getenv("IMAGE_BACKEND_BACKUP", "").strip())
+    image_provider_primary: str = field(default_factory=lambda: os.getenv("IMAGE_PROVIDER_PRIMARY", "").strip())
+    cf_api_token: str = field(default_factory=lambda: os.getenv("CF_API_TOKEN", "").strip())
+    cf_account_id: str = field(default_factory=lambda: os.getenv("CF_ACCOUNT_ID", "").strip())
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "10000")))
 
     def webhook_url(self) -> str:
