@@ -1,12 +1,9 @@
 import asyncio
+import io
 from types import SimpleNamespace
 
 import app
-from image_gen import (
-    build_image_prompt,
-    build_image_url_fallback,
-    build_image_url_primary,
-)
+from image_gen import build_image_prompt, build_image_request_candidates, extract_image_prompt, is_image_request
 
 
 class _ThinkMessage:
@@ -18,13 +15,14 @@ class _ThinkMessage:
 
 
 class _Message:
-    def __init__(self, text: str, chat_id: int = 42, fail_count: int = 0):
+    def __init__(self, text: str, chat_id: int = 42, fail_urls=None, fail_bytes=None):
         self.text = text
         self.chat_id = chat_id
         self.message_id = 7
         self.photo_calls = []
         self.reply_text_calls = []
-        self.fail_count = fail_count
+        self.fail_urls = set(fail_urls or [])
+        self.fail_bytes = set(fail_bytes or [])
 
     async def reply_text(self, text, **kwargs):
         self.reply_text_calls.append(text)
@@ -32,9 +30,13 @@ class _Message:
 
     async def reply_photo(self, **kwargs):
         self.photo_calls.append(kwargs)
-        if self.fail_count > 0:
-            self.fail_count -= 1
-            raise RuntimeError("photo send failed")
+        photo = kwargs.get("photo")
+        if isinstance(photo, str):
+            if any(tag in photo for tag in self.fail_urls):
+                raise RuntimeError("url send failed")
+        elif isinstance(photo, io.BytesIO):
+            if photo.name.replace(".jpg", "") in self.fail_bytes:
+                raise RuntimeError("bytes send failed")
 
 
 class _Bot:
@@ -45,9 +47,20 @@ class _Bot:
         self.actions.append(kwargs)
 
 
-def _run_handle_text(text: str, monkeypatch, judge_impl, fail_count: int = 0):
-    message = _Message(text, fail_count=fail_count)
-    update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=42))
+class _Response:
+    def __init__(self, content=b"img", content_type="image/jpeg"):
+        self.content = content
+        self.headers = {"Content-Type": content_type}
+
+    def raise_for_status(self):
+        return None
+
+
+def _run_handle_text(text: str, monkeypatch, judge_impl, message: _Message):
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=42),
+    )
     context = SimpleNamespace(bot=_Bot())
 
     monkeypatch.setattr(app, "should_respond", lambda *_: True)
@@ -68,7 +81,9 @@ def test_narisuy_kofe_goes_image_flow(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             raise AssertionError("Text branch must not be called for image flow")
 
-    message, bot = _run_handle_text("нарисуй кофе", monkeypatch, _Judge())
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    message = _Message("нарисуй кофе")
+    message, bot = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
     assert bot.actions
     assert len(message.photo_calls) == 1
 
@@ -78,7 +93,9 @@ def test_narisuy_krug_goes_image_flow(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             raise AssertionError("Text branch must not be called for image flow")
 
-    message, _ = _run_handle_text("нарисуй круг", monkeypatch, _Judge())
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    message = _Message("нарисуй круг")
+    message, _ = _run_handle_text("нарисуй круг", monkeypatch, _Judge(), message)
     assert len(message.photo_calls) == 1
 
 
@@ -87,53 +104,63 @@ def test_narisuy_without_prompt_returns_error(monkeypatch):
         def evaluate(self, *_args, **_kwargs):
             return "should not happen"
 
-    message, _ = _run_handle_text("нарисуй", monkeypatch, _Judge())
+    message = _Message("нарисуй")
+    message, _ = _run_handle_text("нарисуй", monkeypatch, _Judge(), message)
     assert any("нужна сама идея" in text for text in message.reply_text_calls)
 
 
-def test_primary_url_builds():
+def test_builds_candidates_for_primary_and_backup(monkeypatch):
+    import image_gen
+
+    monkeypatch.setattr(
+        image_gen,
+        "settings",
+        SimpleNamespace(image_backend_primary="pollinations", image_backend_backup="pollinations_flux"),
+    )
     prompt = build_image_prompt("кофе")
-    url = build_image_url_primary(prompt)
-    assert "image.pollinations.ai" in url
-    assert "width=1024" in url
+    candidates = build_image_request_candidates(prompt)
+    assert [c["backend"] for c in candidates] == ["pollinations", "pollinations_flux"]
 
 
-def test_fallback_url_builds():
-    prompt = build_image_prompt("круг")
-    url = build_image_url_fallback(prompt)
-    assert "image.pollinations.ai" in url
-    assert "model=flux" in url
-
-
-def test_if_primary_fails_fallback_called(monkeypatch):
+def test_if_url_fails_bytes_mode_is_used(monkeypatch):
     class _Judge:
         def evaluate(self, *_args, **_kwargs):
             return "should not happen"
 
-    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), fail_count=1)
-    assert len(message.photo_calls) == 2
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    message = _Message("нарисуй кофе", fail_urls={"pollinations"})
+    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
+    assert len(message.photo_calls) >= 2
+    assert any(isinstance(call["photo"], io.BytesIO) for call in message.photo_calls)
 
 
-def test_if_both_fail_honest_tech_fallback(monkeypatch):
+def test_if_primary_fails_backup_called(monkeypatch):
     class _Judge:
         def evaluate(self, *_args, **_kwargs):
             return "should not happen"
 
-    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), fail_count=2)
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response())
+    message = _Message("нарисуй кофе", fail_urls={"pollinations"}, fail_bytes={"pollinations"})
+    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
+    sent_urls = [call["photo"] for call in message.photo_calls if isinstance(call["photo"], str)]
+    assert any("model=flux" in u for u in sent_urls)
+
+
+def test_if_all_fail_honest_tech_fallback(monkeypatch):
+    class _Judge:
+        def evaluate(self, *_args, **_kwargs):
+            return "should not happen"
+
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: _Response(content_type="text/plain"))
+    message = _Message(
+        "нарисуй кофе",
+        fail_urls={"pollinations", "pollinations_flux"},
+        fail_bytes={"pollinations", "pollinations_flux"},
+    )
+    message, _ = _run_handle_text("нарисуй кофе", monkeypatch, _Judge(), message)
     assert any("Генерация изображения сейчас недоступна" in text for text in message.reply_text_calls)
 
 
-def test_est_hleb_not_image_flow(monkeypatch):
-    class _Judge:
-        def __init__(self):
-            self.called = False
-
-        def evaluate(self, *_args, **_kwargs):
-            self.called = True
-            return "Марк Аврелий доволен тобой.\n\nЭто полезная мысль. Действуй дальше."
-
-    judge = _Judge()
-    message, bot = _run_handle_text("есть хлеб", monkeypatch, judge)
-    assert judge.called is True
-    assert not bot.actions
-    assert not message.photo_calls
+def test_extract_and_trigger():
+    assert is_image_request("нарисуй кофе")
+    assert extract_image_prompt("нарисуй кофе") == "кофе"

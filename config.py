@@ -23,6 +23,14 @@ class Settings:
     public_base_url: str = field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"))
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openrouter_model: str = field(default_factory=lambda: os.getenv("OPENROUTER_MODEL", "openrouter/free").strip())
+    openrouter_model_primary: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_MODEL_PRIMARY", "").strip()
+    )
+    openrouter_model_backup: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_MODEL_BACKUP", "").strip()
+    )
+    image_backend_primary: str = field(default_factory=lambda: os.getenv("IMAGE_BACKEND_PRIMARY", "").strip())
+    image_backend_backup: str = field(default_factory=lambda: os.getenv("IMAGE_BACKEND_BACKUP", "").strip())
     port: int = field(default_factory=lambda: int(os.getenv("PORT", "10000")))
 
     def webhook_url(self) -> str:

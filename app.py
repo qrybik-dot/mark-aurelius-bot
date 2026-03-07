@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import logging
+import io
 import re
 import threading
 import time
@@ -14,11 +15,9 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from config import settings, validate_settings
 from image_gen import (
     build_image_prompt,
-    build_image_url_fallback,
-    build_image_url_primary,
+    build_image_request_candidates,
     extract_image_prompt,
     is_image_request,
-    normalize_image_prompt,
 )
 from prompts import EMPTY_MENTION_REPLY, IMAGE_CAPTION_TEMPLATE, THINKING_TEXT
 from stoic_ai import StoicJudge
@@ -70,6 +69,8 @@ def should_respond(update: Update, bot_username: str) -> bool:
     if not message or not chat or not message.text:
         return False
 
+    logger.info("Incoming chat type: %s", chat.type)
+
     if chat.type == ChatType.PRIVATE:
         return True
 
@@ -83,6 +84,10 @@ def should_respond(update: Update, bot_username: str) -> bool:
         )
         mention_pattern = re.compile(rf"@{re.escape(normalize_username(bot_username))}\b", re.IGNORECASE)
         has_mention = bool(mention_pattern.search(message.text))
+        logger.info("Mention detected: %s", has_mention)
+        logger.info("Reply-to-bot detected: %s", is_reply_to_bot)
+        if not (is_reply_to_bot or has_mention):
+            logger.info("Ignoring group message because no mention/reply")
         return is_reply_to_bot or has_mention
 
     return False
@@ -120,20 +125,29 @@ def apply_style_command(chat_id: int, stripped_text: str) -> str | None:
 
 async def send_generated_image(message, context, chat_id: int, prompt_raw: str) -> None:
     logger.info("Image request received: %s", prompt_raw)
-    normalized_prompt = normalize_image_prompt(prompt_raw)
     prompt_en = build_image_prompt(prompt_raw)
-    logger.info("Image prompt normalized: %s", normalized_prompt)
+    logger.info("Image prompt normalized: %s", prompt_en)
 
     if not prompt_en:
         await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не изображает пустоту.")
         return
 
-    primary_url = build_image_url_primary(prompt_en)
-    fallback_url = build_image_url_fallback(prompt_en)
+    try:
+        import requests
+    except Exception as exc:
+        logger.warning("requests недоступен для image bytes fallback: %s", exc)
+        requests = None
+
+    candidates = build_image_request_candidates(prompt_en)
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
-    for backend_name, image_url in (("primary", primary_url), ("fallback", fallback_url)):
-        logger.info("Image backend=%s url=%s", backend_name, image_url)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        backend_name = candidate.get("backend", "unknown")
+        image_url = candidate.get("url", "")
+        logger.info("Trying image backend: %s", backend_name)
+        logger.info("Trying image URL: %s", image_url)
+
         try:
             await message.reply_photo(
                 photo=image_url,
@@ -142,8 +156,36 @@ async def send_generated_image(message, context, chat_id: int, prompt_raw: str) 
             )
             return
         except Exception as exc:
-            logger.warning("Image send failed on backend=%s: %s", backend_name, exc)
+            last_error = exc
+            logger.warning("Image URL send failed: %s (%s)", backend_name, exc)
 
+        if requests is None:
+            logger.warning("Image bytes send failed: %s", backend_name)
+            continue
+
+        try:
+            response = requests.get(image_url, timeout=20)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            if "image" not in content_type.lower():
+                raise ValueError(f"unexpected content type: {content_type}")
+            photo_stream = io.BytesIO(response.content)
+            photo_stream.name = f"{backend_name}.jpg"
+            await message.reply_photo(
+                photo=photo_stream,
+                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
+                reply_to_message_id=message.message_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Image bytes send failed: %s (%s)", backend_name, exc)
+            logger.warning("Image backend failed: %s", backend_name)
+
+    if last_error is not None:
+        logger.exception("Image backend exhausted", exc_info=(type(last_error), last_error, last_error.__traceback__))
+    else:
+        logger.exception("Image backend exhausted")
     await message.reply_text(
         "Генерация изображения сейчас недоступна. Текстовый суд работает, а визуальный — нет."
     )
@@ -192,9 +234,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception:
         logger.exception("Failed to evaluate text request")
-        final_text = (
-            "Я бы ответил точнее, но сегодня даже разум спотыкается о судьбу. "
-            "Скажи мысль проще и короче — разберём хладнокровно."
+        verdict, explanation = judge.analyze_deterministic(clean_text)
+        final_text = judge.render_final(
+            verdict,
+            explanation,
+            style_mode=style_state.get("mode", "default"),
+            custom_style=style_state.get("custom", ""),
         )
     await think_message.edit_text(final_text)
 

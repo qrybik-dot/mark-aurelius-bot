@@ -1,6 +1,8 @@
 import re
 from urllib.parse import quote
 
+from config import settings
+
 IMAGE_TRIGGERS = [
     "нарисуй",
     "изобрази",
@@ -9,8 +11,16 @@ IMAGE_TRIGGERS = [
     "нагенерируй",
 ]
 
-PRIMARY_IMAGE_ENDPOINT = "https://image.pollinations.ai/prompt"
-FALLBACK_IMAGE_ENDPOINT = "https://image.pollinations.ai/prompt"
+_IMAGE_BACKENDS = {
+    "pollinations": {
+        "endpoint": "https://image.pollinations.ai/prompt",
+        "params": "width=1024&height=1024&nologo=true",
+    },
+    "pollinations_flux": {
+        "endpoint": "https://image.pollinations.ai/prompt",
+        "params": "width=768&height=768&model=flux&nologo=true",
+    },
+}
 
 
 _RU_IMAGE_HINTS = {
@@ -19,9 +29,27 @@ _RU_IMAGE_HINTS = {
     "хлеб": "fresh bread loaf",
     "солнце": "bright sun in the sky",
     "круг": "simple geometric circle on clean background",
+    "картина": "artistic painting",
     "философ": "ancient philosopher portrait",
+    "император": "ancient roman emperor portrait",
     "парашютист": "skydiver in freefall",
+    "стоик": "stoic philosopher portrait",
+    "небо": "dramatic sky",
+    "облака": "clouds in the sky",
 }
+
+
+def _configured_image_backends() -> list[str]:
+    primary = settings.image_backend_primary or "pollinations"
+    backup = settings.image_backend_backup or "pollinations_flux"
+    backends = [primary, backup]
+    deduped: list[str] = []
+    for backend in backends:
+        if backend and backend in _IMAGE_BACKENDS and backend not in deduped:
+            deduped.append(backend)
+    if not deduped:
+        deduped = ["pollinations", "pollinations_flux"]
+    return deduped
 
 
 def is_image_request(text: str) -> bool:
@@ -56,11 +84,31 @@ def build_image_prompt(prompt_raw: str) -> str:
     return f"{normalized}, highly detailed, clean composition"
 
 
-def build_image_url_primary(prompt_en: str) -> str:
+def _build_backend_url(prompt_en: str, backend: str) -> str:
     safe_prompt = quote(prompt_en.strip())
-    return f"{PRIMARY_IMAGE_ENDPOINT}/{safe_prompt}?width=1024&height=1024&nologo=true"
+    cfg = _IMAGE_BACKENDS[backend]
+    return f"{cfg['endpoint']}/{safe_prompt}?{cfg['params']}"
+
+
+def build_image_request_candidates(prompt_en: str) -> list[dict[str, str]]:
+    if not prompt_en:
+        return []
+
+    candidates: list[dict[str, str]] = []
+    for backend in _configured_image_backends():
+        candidates.append(
+            {
+                "backend": backend,
+                "mode": "url",
+                "url": _build_backend_url(prompt_en, backend),
+            }
+        )
+    return candidates
+
+
+def build_image_url_primary(prompt_en: str) -> str:
+    return _build_backend_url(prompt_en, "pollinations")
 
 
 def build_image_url_fallback(prompt_en: str) -> str:
-    safe_prompt = quote(prompt_en.strip())
-    return f"{FALLBACK_IMAGE_ENDPOINT}/{safe_prompt}?width=768&height=768&model=flux&nologo=true"
+    return _build_backend_url(prompt_en, "pollinations_flux")
