@@ -19,6 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logger.info("Telegram token loaded: %s", bool(settings.telegram_bot_token))
+
 flask_app = Flask(__name__)
 judge = StoicJudge()
 
