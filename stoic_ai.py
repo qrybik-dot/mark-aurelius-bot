@@ -1,36 +1,163 @@
+import json
 import logging
-import random
+import re
 from typing import Optional
 
 from config import settings
-from prompts import OPENING_VARIANTS, STYLE_INSTRUCTIONS, SYSTEM_PROMPT
+from prompts import STYLE_INSTRUCTIONS, SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+FALLBACK_EXPLANATIONS = {
+    "positive": (
+        "В этом есть движение и польза. Лучше действовать осмысленно, "
+        "чем разлагаться в пустых желаниях."
+    ),
+    "negative": (
+        "Это звучит слабо и без внутреннего стержня. "
+        "Выбери не самое простое, а самое достойное."
+    ),
+    "empty": "Мысль слишком пустая и сырая. Сформулируй её ясно, если хочешь честный суд.",
+}
+
+VERDICT_LINES = {
+    "positive": "Марк Аврелий доволен тобой.",
+    "negative": "Марк Аврелий недоволен тобой.",
+}
+
+RESPONSE_SCHEMA = {
+    "name": "stoic_verdict",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["positive", "negative"]},
+            "explanation": {"type": "string"},
+        },
+        "required": ["verdict", "explanation"],
+        "additionalProperties": False,
+    },
+}
+
+
+def normalize_explanation(explanation: str) -> str:
+    text = re.sub(r"\s+", " ", (explanation or "").strip())
+    if not text:
+        return ""
+
+    has_cyrillic = bool(re.search(r"[А-Яа-яЁё]", text))
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    if not has_cyrillic or latin_count > 12:
+        return ""
+
+    sentence_count = len([part for part in re.split(r"[.!?]+", text) if part.strip()])
+    if sentence_count < 2:
+        return ""
+
+    if len(text) > 500:
+        text = text[:500].rstrip(" ,;:-") + "."
+
+    return text
+
+
+def style_explanation(explanation: str, style_mode: str = "default", custom_style: str = "") -> str:
+    base = explanation.strip()
+    if style_mode == "stoic":
+        first_sentence = re.split(r"(?<=[.!?])\s+", base)[0].strip()
+        return first_sentence or base
+    if style_mode == "bold":
+        return f"Сурово, но честно: {base}"
+    if style_mode == "custom" and custom_style:
+        return f"Стиль «{custom_style}»: {base}"
+    return base
+
+
+def build_final_reply(verdict: str, explanation: str) -> str:
+    verdict_key = verdict if verdict in VERDICT_LINES else "negative"
+    cleaned_explanation = normalize_explanation(explanation)
+    if not cleaned_explanation:
+        cleaned_explanation = (
+            FALLBACK_EXPLANATIONS["empty"]
+            if not (explanation or "").strip()
+            else FALLBACK_EXPLANATIONS[verdict_key]
+        )
+    return f"{VERDICT_LINES[verdict_key]}\n\n{cleaned_explanation}"
 
 
 def build_system_prompt(style_mode: str = "default", custom_style: str = "") -> list[dict[str, str]]:
     style_layer = STYLE_INSTRUCTIONS.get(style_mode, STYLE_INSTRUCTIONS["default"])
     if style_mode == "custom" and custom_style:
         style_layer = (
-            "Используй описанную пользователем манеру речи: "
-            f"{custom_style}. Не нарушай safety и не уходи в бессмысленный фарс."
+            "Манера объяснения: "
+            f"{custom_style}. Держи объяснение читабельным, коротким и безопасным."
         )
+
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": style_layer},
     ]
 
 
+def analyze_idea_fallback(user_text: str) -> tuple[str, str]:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return "negative", FALLBACK_EXPLANATIONS["empty"]
+
+    words = re.findall(r"[а-яёa-z]+", text)
+    if len(words) < 2:
+        return "negative", FALLBACK_EXPLANATIONS["empty"]
+
+    negative_markers = [
+        "вред",
+        "груб",
+        "лень",
+        "пуст",
+        "слаб",
+        "бессодерж",
+        "мст",
+        "прокраст",
+        "злост",
+        "оскорб",
+    ]
+    positive_markers = [
+        "развит",
+        "действ",
+        "спорт",
+        "дело",
+        "решени",
+        "учеб",
+        "трен",
+        "работ",
+        "дисциплин",
+        "коньк",
+    ]
+
+    neg_score = sum(marker in text for marker in negative_markers)
+    pos_score = sum(marker in text for marker in positive_markers)
+
+    if neg_score > 0 and neg_score >= pos_score:
+        return "negative", FALLBACK_EXPLANATIONS["negative"]
+    if pos_score > neg_score:
+        return "positive", FALLBACK_EXPLANATIONS["positive"]
+    return "negative", FALLBACK_EXPLANATIONS["empty"]
+
+
 class StoicJudge:
     def evaluate(self, user_text: str, style_mode: str = "default", custom_style: str = "") -> str:
-        ai_reply = self._openrouter_reply(user_text, style_mode, custom_style)
-        if ai_reply:
-            return ai_reply
-        return self._fallback_reply(user_text, style_mode)
+        model_result = self._openrouter_reply(user_text, style_mode, custom_style)
+        if model_result is None:
+            verdict, explanation = analyze_idea_fallback(user_text)
+        else:
+            verdict, explanation = model_result
 
-    def _openrouter_reply(self, user_text: str, style_mode: str, custom_style: str) -> Optional[str]:
+        styled = style_explanation(explanation, style_mode=style_mode, custom_style=custom_style)
+        return build_final_reply(verdict, styled)
+
+    def _openrouter_reply(
+        self, user_text: str, style_mode: str, custom_style: str
+    ) -> Optional[tuple[str, str]]:
         if not settings.openrouter_api_key:
             logger.warning("OPENROUTER_API_KEY не задан, включаю fallback")
             return None
@@ -41,18 +168,27 @@ class StoicJudge:
             logger.warning("requests недоступен (%s), включаю fallback", exc)
             return None
 
+        model_name = settings.openrouter_model or "openrouter/free"
+        logger.info("OpenRouter model selected: %s", model_name)
+        if model_name == "openrouter/free":
+            logger.warning(
+                "Using openrouter/free router: output may vary because free models are selected dynamically"
+            )
+
         headers = {
             "Authorization": f"Bearer {settings.openrouter_api_key}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": settings.openrouter_model or "openrouter/free",
+            "model": model_name,
             "messages": [
                 *build_system_prompt(style_mode, custom_style),
                 {"role": "user", "content": user_text},
             ],
-            "temperature": 0.8,
+            "temperature": 0.3,
             "max_tokens": 220,
+            "seed": 42,
+            "response_format": {"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
         }
 
         try:
@@ -62,46 +198,15 @@ class StoicJudge:
                 return None
             response.raise_for_status()
             data = response.json()
-            content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            return content or None
-        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
-            logger.warning("Ошибка запроса к OpenRouter: %s", exc)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = json.loads(content)
+            verdict = parsed.get("verdict")
+            explanation = parsed.get("explanation", "")
+            if verdict not in {"positive", "negative"}:
+                raise ValueError("invalid verdict")
+            if not isinstance(explanation, str):
+                raise ValueError("invalid explanation")
+            return verdict, explanation
+        except (requests.RequestException, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            logger.warning("Structured output parse failed, using deterministic fallback: %s", exc)
             return None
-
-    def _fallback_reply(self, user_text: str, style_mode: str = "default") -> str:
-        text = user_text.lower()
-        good_markers = ["спорт", "читать", "учёб", "учеб", "дисциплин", "работ", "помог", "сон"]
-        bad_markers = ["мст", "лень", "вран", "завист", "злост", "алкогол", "прокраст", "измен"]
-
-        score = sum(marker in text for marker in good_markers) - sum(
-            marker in text for marker in bad_markers
-        )
-
-        if score >= 0:
-            verdict = "Марк Аврелий доволен тобой."
-            reason = (
-                "Ты хотя бы пытаешься управлять собой, а не погодой в голове. "
-                "Это уже редкость в эпоху импульсивных подвигов и ленивых оправданий. "
-                "Продолжай: достоинство растёт от повторения, а не от красивых обещаний."
-            )
-        else:
-            verdict = "Марк Аврелий недоволен тобой."
-            reason = (
-                "Ты снова назначил эмоции полководцами, а разум — писарем на побегушках. "
-                "Так справедливость к себе не строят, так строят хаос с самоиронией. "
-                "Соберись: свобода начинается там, где заканчиваются удобные отговорки."
-            )
-
-        if style_mode == "bold":
-            opener = random.choice(OPENING_VARIANTS)
-            return f"{opener}\n\n{verdict}\n\n{reason}"
-        if style_mode == "stoic":
-            return f"{verdict}\n\n{reason.split('. ')[0].strip()}."
-        if style_mode == "custom":
-            return f"{verdict}\n\n{reason}"
-        return f"{verdict}\n\n{reason}"

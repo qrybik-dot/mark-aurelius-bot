@@ -2,7 +2,6 @@ import asyncio
 import atexit
 import concurrent.futures
 import logging
-import random
 import re
 import threading
 import time
@@ -13,7 +12,14 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from config import settings, validate_settings
-from image_gen import build_image_prompt, generate_image_url
+from image_gen import (
+    build_image_prompt,
+    build_image_url_fallback,
+    build_image_url_primary,
+    extract_image_prompt,
+    is_image_request,
+    normalize_image_prompt,
+)
 from prompts import EMPTY_MENTION_REPLY, IMAGE_CAPTION_TEMPLATE, THINKING_TEXT
 from stoic_ai import StoicJudge
 
@@ -87,12 +93,6 @@ def strip_bot_mention(text: str, bot_username: str) -> str:
     return pattern.sub("", text).strip()
 
 
-def parse_image_prompt(stripped_text: str) -> str:
-    if not stripped_text.lower().startswith("нарисуй"):
-        return ""
-    return stripped_text[len("нарисуй"):].strip(" :,-.")
-
-
 def apply_style_command(chat_id: int, stripped_text: str) -> str | None:
     lowered_text = stripped_text.lower()
 
@@ -116,6 +116,37 @@ def apply_style_command(chat_id: int, stripped_text: str) -> str | None:
             return f"Принято. Теперь говорю в таком стиле: {custom_style}"
 
     return None
+
+
+async def send_generated_image(message, context, chat_id: int, prompt_raw: str) -> None:
+    logger.info("Image request received: %s", prompt_raw)
+    normalized_prompt = normalize_image_prompt(prompt_raw)
+    prompt_en = build_image_prompt(prompt_raw)
+    logger.info("Image prompt normalized: %s", normalized_prompt)
+
+    if not prompt_en:
+        await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не изображает пустоту.")
+        return
+
+    primary_url = build_image_url_primary(prompt_en)
+    fallback_url = build_image_url_fallback(prompt_en)
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+
+    for backend_name, image_url in (("primary", primary_url), ("fallback", fallback_url)):
+        logger.info("Image backend=%s url=%s", backend_name, image_url)
+        try:
+            await message.reply_photo(
+                photo=image_url,
+                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
+                reply_to_message_id=message.message_id,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Image send failed on backend=%s: %s", backend_name, exc)
+
+    await message.reply_text(
+        "Генерация изображения сейчас недоступна. Текстовый суд работает, а визуальный — нет."
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -142,33 +173,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(style_reply)
         return
 
-    if lowered_text.startswith("нарисуй"):
-        prompt_raw = parse_image_prompt(stripped_text)
+    if is_image_request(lowered_text):
+        prompt_raw = extract_image_prompt(stripped_text)
         if not prompt_raw:
             await message.reply_text("После слова 'нарисуй' нужна сама идея. Даже император не изображает пустоту.")
             return
-
-        logger.info("Image request received: %s", prompt_raw)
-        prompt_en = build_image_prompt(prompt_raw)
-        logger.info("Image prompt normalized: %s", prompt_en)
-        image_url = generate_image_url(prompt_en)
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-        try:
-            await message.reply_photo(
-                photo=image_url,
-                caption=IMAGE_CAPTION_TEMPLATE.format(prompt=prompt_raw[:120]),
-                reply_to_message_id=message.message_id,
-            )
-        except Exception:
-            logger.exception("Failed to send generated image")
-            await message.reply_text(
-                "Марк Аврелий хотел бы это изобразить, но небеса сегодня скупы на визуальные откровения. "
-                "Сформулируй образ точнее."
-            )
+        await send_generated_image(message, context, chat_id, prompt_raw)
         return
 
     think_message = await message.reply_text(THINKING_TEXT, reply_to_message_id=message.message_id)
-    await asyncio.sleep(random.uniform(2.0, 3.0))
+    await asyncio.sleep(0.05)
     style_state = style_by_chat.get(chat_id, {"mode": "default", "custom": ""})
     try:
         final_text = judge.evaluate(
