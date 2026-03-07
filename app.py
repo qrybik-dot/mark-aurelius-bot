@@ -1,7 +1,10 @@
 import asyncio
+import atexit
+import concurrent.futures
 import logging
 import random
 import re
+import threading
 
 from flask import Flask, jsonify, request
 from telegram import Update
@@ -25,6 +28,8 @@ flask_app = Flask(__name__)
 judge = StoicJudge()
 
 telegram_app = None
+telegram_loop = None
+telegram_loop_thread = None
 _is_initialized = False
 
 
@@ -39,7 +44,12 @@ def get_telegram_app() -> Application | None:
 
     telegram_app = Application.builder().token(settings.telegram_bot_token).build()
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    telegram_app.add_error_handler(handle_telegram_error)
     return telegram_app
+
+
+async def handle_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Ошибка в Telegram handler. Update=%s", update, exc_info=context.error)
 
 
 def normalize_username(username: str) -> str:
@@ -108,16 +118,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await think_message.edit_text(final_text)
 
 
-async def initialize_telegram() -> None:
-    global _is_initialized
-    if _is_initialized:
-        return
-
-    app = get_telegram_app()
-    if app is None:
-        logger.warning("TELEGRAM_BOT_TOKEN не задан. Telegram приложение не инициализировано.")
-        return
-
+async def initialize_telegram_app(app: Application) -> None:
     await app.initialize()
 
     if settings.public_base_url and settings.webhook_secret:
@@ -131,7 +132,61 @@ async def initialize_telegram() -> None:
     else:
         logger.warning("PUBLIC_BASE_URL или WEBHOOK_SECRET не заданы. Webhook не установлен.")
 
+
+def run_telegram_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def initialize_telegram() -> None:
+    global _is_initialized, telegram_loop, telegram_loop_thread
+    if _is_initialized:
+        return
+
+    app = get_telegram_app()
+    if app is None:
+        logger.warning("TELEGRAM_BOT_TOKEN не задан. Telegram приложение не инициализировано.")
+        return
+
+    telegram_loop = asyncio.new_event_loop()
+    telegram_loop_thread = threading.Thread(
+        target=run_telegram_loop,
+        args=(telegram_loop,),
+        daemon=True,
+        name="telegram-event-loop",
+    )
+    telegram_loop_thread.start()
+
+    init_future = asyncio.run_coroutine_threadsafe(initialize_telegram_app(app), telegram_loop)
+    init_future.result(timeout=30)
+
     _is_initialized = True
+
+
+def shutdown_telegram() -> None:
+    global telegram_loop, telegram_loop_thread, _is_initialized
+
+    app = get_telegram_app()
+    if app is None or telegram_loop is None:
+        return
+
+    if _is_initialized:
+        shutdown_future = asyncio.run_coroutine_threadsafe(app.shutdown(), telegram_loop)
+        try:
+            shutdown_future.result(timeout=30)
+        except Exception as exc:
+            logger.exception("Ошибка завершения Telegram приложения: %s", exc)
+
+    telegram_loop.call_soon_threadsafe(telegram_loop.stop)
+    if telegram_loop_thread and telegram_loop_thread.is_alive():
+        telegram_loop_thread.join(timeout=5)
+    telegram_loop.close()
+    telegram_loop = None
+    telegram_loop_thread = None
+    _is_initialized = False
+
+
+atexit.register(shutdown_telegram)
 
 
 @flask_app.get("/")
@@ -169,7 +224,14 @@ def telegram_webhook(path_secret: str):
 
     update = Update.de_json(data, app.bot)
     try:
-        asyncio.run(app.process_update(update))
+        if telegram_loop is None:
+            return jsonify({"ok": False, "error": "telegram event loop is not initialized"}), 503
+
+        future = asyncio.run_coroutine_threadsafe(app.process_update(update), telegram_loop)
+        future.result(timeout=30)
+    except concurrent.futures.TimeoutError:
+        logger.exception("Таймаут обработки апдейта")
+        return jsonify({"ok": False}), 500
     except Exception as exc:
         logger.exception("Ошибка обработки апдейта: %s", exc)
         return jsonify({"ok": False}), 500
@@ -183,7 +245,7 @@ def bootstrap() -> None:
         logger.warning("Missing critical settings: %s", ", ".join(missing_critical))
 
     try:
-        asyncio.run(initialize_telegram())
+        initialize_telegram()
     except Exception as exc:
         logger.exception("Ошибка инициализации Telegram webhook: %s", exc)
 
